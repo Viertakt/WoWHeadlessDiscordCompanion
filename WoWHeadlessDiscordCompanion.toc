@@ -1,0 +1,8 @@
+## Interface: 11200
+## Title: WHDC
+## Notes: WoW Headless Discord Companion bridge addon for 1.12.1 / Turtle WoW
+## Author: WHDC Contributors
+## Version: 0.1.0
+## SavedVariables: WHDC_DB
+
+WoWHeadlessDiscordCompanion.lua
