@@ -11,15 +11,19 @@ The `.toc` and `.lua` names match (`WoWHeadlessDiscordCompanion`).
 
 ## IPC model
 
-It uses WoW's in-game addon message channel (`SendAddonMessage`/`CHAT_MSG_ADDON`) and signs every IPC line with a shared password.
+It uses WoW's in-game addon message channel (`SendAddonMessage`/`CHAT_MSG_ADDON`) and supports bridge sync-channel chat transport (`CHAT_MSG_CHANNEL`) for `CHANNEL` forwarding with queued/rate-limited sends.
 
 Signature algorithm used by the addon:
 
 `sig = sum(bytes((cmd|nonce|payload) + "|" + password)) mod 65535`
 
-Line format:
+Line format (Envelope A):
 
 `cmd|nonce|payload|sig`
+
+It also accepts file-transport compatibility frames (Envelope B):
+
+`ts|cmd|nonce|payload|sig`
 
 ## What it does
 
@@ -27,6 +31,8 @@ Line format:
 - Supports `/whdc pwd <password> [channel]` for password + IPC channel setup.
 - Stores payloads in addon SavedVariables and attempts SuperWoW/Turtle-style export to `/wow/imports/<name>.txt` when a file API is available.
 - Sends and validates signed IPC lines over the WoW addon channel.
+- Rejects malformed/unsigned/replayed frames.
+- Handles baseline protocol commands like `PING`/`PONG` and `CHANNEL`/`CHANNEL_ACK`.
 - Includes a simple in-game GUI (`/whdc gui`) with **Run** and **Test** buttons.
 
 ## Commands
@@ -38,6 +44,8 @@ Line format:
 - `/whdc send <name>`
 - `/whdc pull <name>`
 - `/whdc test`
+- `/whdc sync <channel_name> [channel_pass]`
+- `/whdc ipc <COMMAND> [payload]`
 - `/whdc gui`
 
 ## Install
