@@ -11,7 +11,7 @@ The `.toc` and `.lua` names match (`WoWHeadlessDiscordCompanion`).
 
 ## IPC model
 
-This addon does **not** use internet/network sockets. It uses WoW's in-game addon message channel (`SendAddonMessage`/`CHAT_MSG_ADDON`) and signs every IPC line with a shared password.
+It uses WoW's in-game addon message channel (`SendAddonMessage`/`CHAT_MSG_ADDON`) and signs every IPC line with a shared password.
 
 Signature algorithm used by the addon:
 
