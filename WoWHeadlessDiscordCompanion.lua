@@ -7,11 +7,18 @@ local WHDC = {}
 WHDC.defaults = {
   password = "change-me",
   channel = "GUILD",
+  channel_name = "WHDC_SYNC",
+  channel_pass = "",
   prefix = "WHDC",
   nonce = 0,
   payloads = {},
   relayQueue = {},
-  history = {}
+  history = {},
+  replayWindowSeconds = 180,
+  recentFrames = {},
+  channelSendQueue = {},
+  channelMinInterval = 1.0,
+  lastChannelSendAt = 0
 }
 
 local function whdc_msg(text)
@@ -65,7 +72,79 @@ local function whdc_pack_line(cmd, nonce, payload, sig)
 end
 
 local function whdc_unpack_line(line)
-  return string.match(line, "^([^|]+)|([^|]+)|([^|]*)|([^|]+)$")
+  local function parse_a(raw)
+    local p1 = string.find(raw, "|", 1, true)
+    if not p1 then return nil end
+    local p2 = string.find(raw, "|", p1 + 1, true)
+    if not p2 then return nil end
+    local rev = string.reverse(raw)
+    local lastFromEnd = string.find(rev, "|", 1, true)
+    if not lastFromEnd then return nil end
+    local pLast = string.len(raw) - lastFromEnd + 1
+    if p2 >= pLast then return nil end
+
+    local cmd = string.sub(raw, 1, p1 - 1)
+    local nonce = string.sub(raw, p1 + 1, p2 - 1)
+    local payload = string.sub(raw, p2 + 1, pLast - 1)
+    local sig = string.sub(raw, pLast + 1)
+    return cmd, nonce, payload, sig
+  end
+
+  local function parse_b(raw)
+    local p1 = string.find(raw, "|", 1, true)
+    if not p1 then return nil end
+    local p2 = string.find(raw, "|", p1 + 1, true)
+    if not p2 then return nil end
+    local p3 = string.find(raw, "|", p2 + 1, true)
+    if not p3 then return nil end
+    local rev = string.reverse(raw)
+    local lastFromEnd = string.find(rev, "|", 1, true)
+    if not lastFromEnd then return nil end
+    local pLast = string.len(raw) - lastFromEnd + 1
+    if p3 >= pLast then return nil end
+
+    local cmd = string.sub(raw, p1 + 1, p2 - 1)
+    local nonce = string.sub(raw, p2 + 1, p3 - 1)
+    local payload = string.sub(raw, p3 + 1, pLast - 1)
+    local sig = string.sub(raw, pLast + 1)
+    return cmd, nonce, payload, sig
+  end
+
+  local cmd, nonce, payload, sig = parse_a(line)
+  if cmd then
+    return cmd, nonce, payload, sig
+  end
+
+  return parse_b(line)
+end
+
+local function whdc_is_safe_token(value)
+  return value and value ~= "" and not string.find(value, "|", 1, true)
+end
+
+local function whdc_prune_recent_frames()
+  local now = time()
+  local keep = {}
+  local i
+  for i = 1, table.getn(WHDC_DB.recentFrames) do
+    local row = WHDC_DB.recentFrames[i]
+    if now - row.at <= WHDC_DB.replayWindowSeconds then
+      table.insert(keep, row)
+    end
+  end
+  WHDC_DB.recentFrames = keep
+end
+
+local function whdc_frame_seen(line)
+  whdc_prune_recent_frames()
+  local i
+  for i = 1, table.getn(WHDC_DB.recentFrames) do
+    if WHDC_DB.recentFrames[i].line == line then
+      return true
+    end
+  end
+  table.insert(WHDC_DB.recentFrames, { line = line, at = time() })
+  return false
 end
 
 local function whdc_write_import(name, payload)
@@ -98,6 +177,12 @@ function WHDC:SetPassword(password, channel)
   whdc_msg("IPC config updated. Channel=" .. WHDC_DB.channel)
 end
 
+function WHDC:SetSyncChannel(name, pass)
+  WHDC_DB.channel_name = name
+  WHDC_DB.channel_pass = pass or ""
+  whdc_msg("Sync channel updated. name=" .. WHDC_DB.channel_name)
+end
+
 function WHDC:StorePayload(name, payload)
   WHDC_DB.payloads[name] = {
     payload = payload,
@@ -125,13 +210,19 @@ function WHDC:ListPayloads()
 end
 
 function WHDC:QueueRelay(cmd, payload)
+  payload = payload or ""
+  if not whdc_is_safe_token(cmd) then
+    return nil, "invalid command token"
+  end
+
   local nonce = whdc_next_nonce()
-  local sig = whdc_cheap_sig(cmd, nonce, payload, WHDC_DB.password)
-  local line = whdc_pack_line(cmd, nonce, payload, sig)
+  local finalCmd = string.upper(cmd)
+  local sig = whdc_cheap_sig(finalCmd, nonce, payload, WHDC_DB.password)
+  local line = whdc_pack_line(finalCmd, nonce, payload, sig)
 
   table.insert(WHDC_DB.relayQueue, {
     ts = whdc_now(),
-    cmd = cmd,
+    cmd = finalCmd,
     nonce = nonce,
     payload = payload,
     sig = sig,
@@ -156,6 +247,18 @@ function WHDC:VerifyLine(line)
     return false, "bad format"
   end
 
+  if not whdc_is_safe_token(cmd) then
+    return false, "empty/invalid cmd"
+  end
+
+  if not whdc_is_safe_token(nonce) then
+    return false, "empty/invalid nonce"
+  end
+
+  if not whdc_is_safe_token(sigStr) then
+    return false, "empty/invalid sig"
+  end
+
   local expected = whdc_cheap_sig(cmd, nonce, payload, WHDC_DB.password)
   local sig = tonumber(sigStr)
   if not sig then
@@ -166,7 +269,58 @@ function WHDC:VerifyLine(line)
     return false, "signature mismatch"
   end
 
+  if whdc_frame_seen(line) then
+    return false, "replay"
+  end
+
   return true, cmd, nonce, payload
+end
+
+function WHDC:SendSyncChannelMessage(message)
+  if not message or message == "" then
+    return false, "empty payload"
+  end
+
+  if type(JoinChannelByName) == "function" then
+    JoinChannelByName(WHDC_DB.channel_name, WHDC_DB.channel_pass)
+  end
+
+  if type(GetChannelName) ~= "function" or type(SendChatMessage) ~= "function" then
+    return false, "chat APIs unavailable"
+  end
+
+  local channelId = GetChannelName(WHDC_DB.channel_name)
+  if not channelId or type(channelId) ~= "number" or channelId <= 0 then
+    return false, "channel unavailable"
+  end
+
+  SendChatMessage(message, "CHANNEL", nil, channelId)
+  return true
+end
+
+function WHDC:QueueSyncChannelMessage(message)
+  table.insert(WHDC_DB.channelSendQueue, {
+    at = time(),
+    text = message
+  })
+end
+
+function WHDC:ProcessSyncChannelQueue(elapsed)
+  WHDC_DB.lastChannelSendAt = (WHDC_DB.lastChannelSendAt or 0) + (elapsed or 0)
+  if WHDC_DB.lastChannelSendAt < WHDC_DB.channelMinInterval then
+    return
+  end
+
+  if table.getn(WHDC_DB.channelSendQueue) == 0 then
+    return
+  end
+
+  local row = table.remove(WHDC_DB.channelSendQueue, 1)
+  WHDC_DB.lastChannelSendAt = 0
+  local ok, err = self:SendSyncChannelMessage(row.text)
+  if not ok then
+    whdc_msg("Sync send failed: " .. err)
+  end
 end
 
 function WHDC:SendPayload(name)
@@ -187,8 +341,21 @@ function WHDC:RequestPayload(name)
 end
 
 function WHDC:RunTest()
-  local line = self:QueueRelay("test", "ok=true")
+  local line = self:QueueRelay("PING", tostring(time()))
   whdc_msg("Sent test line: " .. line)
+end
+
+function WHDC:HandleProtocolCommand(cmd, payload)
+  if cmd == "PING" then
+    self:QueueRelay("PONG", UnitName("player") or "unknown")
+    return
+  end
+
+  if cmd == "CHANNEL" then
+    self:QueueSyncChannelMessage(payload)
+    self:QueueRelay("CHANNEL_ACK", "OK")
+    return
+  end
 end
 
 function WHDC:ReceiveIPC(prefix, line, channel, sender)
@@ -216,6 +383,26 @@ function WHDC:ReceiveIPC(prefix, line, channel, sender)
     cmd = cmd,
     payload = payload
   })
+
+  self:HandleProtocolCommand(cmd, payload)
+end
+
+function WHDC:ReceiveSyncChannel(msg, channelName, sender)
+  if string.upper(channelName or "") ~= string.upper(WHDC_DB.channel_name or "") then
+    return
+  end
+
+  local ok, a, b, c = self:VerifyLine(msg)
+  if not ok then
+    return
+  end
+
+  local cmd = a
+  local nonce = b
+  local payload = c
+  whdc_msg("SYNC recv " .. cmd .. " nonce=" .. nonce .. " from " .. (sender or "?"))
+
+  self:HandleProtocolCommand(cmd, payload)
 end
 
 function WHDC:PrintHelp()
@@ -225,6 +412,8 @@ function WHDC:PrintHelp()
   whdc_msg("/whdc send <name> - send signed import_payload line")
   whdc_msg("/whdc pull <name> - send signed request_import line")
   whdc_msg("/whdc test - send signed test line")
+  whdc_msg("/whdc sync <channel_name> [channel_pass] - set sync chat channel")
+  whdc_msg("/whdc ipc <COMMAND> [payload] - send baseline command frame")
   whdc_msg("/whdc gui - show command GUI")
 end
 
@@ -287,6 +476,31 @@ function WHDC:HandleCommand(msg)
 
   if cmd == "test" then
     self:RunTest()
+    return
+  end
+
+  if cmd == "sync" then
+    local name, pass = string.match(rest, "^(%S+)%s*(.*)$")
+    if not name then
+      whdc_msg("Usage: /whdc sync <channel_name> [channel_pass]")
+      return
+    end
+    self:SetSyncChannel(name, whdc_trim(pass or ""))
+    return
+  end
+
+  if cmd == "ipc" then
+    local outCmd, payload = string.match(rest, "^(%S+)%s*(.*)$")
+    if not outCmd then
+      whdc_msg("Usage: /whdc ipc <COMMAND> [payload]")
+      return
+    end
+    local line, err = self:QueueRelay(string.upper(outCmd), payload or "")
+    if not line then
+      whdc_msg("IPC send rejected: " .. err)
+      return
+    end
+    whdc_msg("Sent signed line: " .. line)
     return
   end
 
@@ -375,6 +589,10 @@ end
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("VARIABLES_LOADED")
 eventFrame:RegisterEvent("CHAT_MSG_ADDON")
+eventFrame:RegisterEvent("CHAT_MSG_CHANNEL")
+eventFrame:SetScript("OnUpdate", function()
+  WHDC:ProcessSyncChannelQueue(arg1 or 0)
+end)
 eventFrame:SetScript("OnEvent", function()
   if event == "VARIABLES_LOADED" then
     WHDC:InitializeDB()
@@ -382,5 +600,8 @@ eventFrame:SetScript("OnEvent", function()
   elseif event == "CHAT_MSG_ADDON" then
     -- Vanilla handler args: arg1=prefix, arg2=message, arg3=channel, arg4=sender
     WHDC:ReceiveIPC(arg1, arg2, arg3, arg4)
+  elseif event == "CHAT_MSG_CHANNEL" then
+    -- Vanilla handler args: arg1=message, arg8=channel name, arg4=sender
+    WHDC:ReceiveSyncChannel(arg1, arg8, arg4)
   end
 end)
