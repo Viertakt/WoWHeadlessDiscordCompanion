@@ -28,24 +28,17 @@ It also accepts file-transport compatibility frames (Envelope B):
 ## What it does
 
 - Registers `/whdc` as the main slash command.
-- Supports `/whdc pwd <password> [channel]` for password + IPC channel setup.
-- Stores payloads in addon SavedVariables and attempts SuperWoW/Turtle-style export to `/wow/imports/<name>.txt` when a file API is available.
 - Sends and validates signed IPC lines over the WoW addon channel.
+- Persists sync settings and password in `WHDC_DB` SavedVariables (`WTF`).
 - Rejects malformed/unsigned/replayed frames.
 - Handles baseline protocol commands like `PING`/`PONG` and `CHANNEL`/`CHANNEL_ACK`.
-- Includes a simple in-game GUI (`/whdc gui`) with **Run** and **Test** buttons.
+- Includes an in-game GUI (`/whdc gui`) with saved inputs for **channel name**, **channel password**, and **IPC password**, plus **Save/Join/Test** actions.
 
 ## Commands
 
 - `/whdc` (help)
-- `/whdc pwd <password> [channel]`
-- `/whdc store <name> <payload>`
-- `/whdc list`
-- `/whdc send <name>`
-- `/whdc pull <name>`
-- `/whdc test`
+- `/whdc test` (queues a signed `PING` frame onto the configured sync channel)
 - `/whdc sync <channel_name> [channel_pass]`
-- `/whdc ipc <COMMAND> [payload]`
 - `/whdc gui`
 
 ## Install
