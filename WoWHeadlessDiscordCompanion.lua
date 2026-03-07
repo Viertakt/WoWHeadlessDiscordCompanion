@@ -470,13 +470,33 @@ function WHDC:ReceiveIPC(prefix, line, channel, sender)
   self:HandleProtocolCommand(cmd, nonce, payload, sender, "addon")
 end
 
+local function whdc_sync_channel_matches(channelName)
+  local configured = string.upper(whdc_trim(WHDC_DB.channel_name or ""))
+  if configured == "" then
+    return false
+  end
+
+  local runtime = string.upper(whdc_trim(tostring(channelName or "")))
+  if runtime == configured then
+    return true
+  end
+
+  local _, _, stripped = string.find(runtime, "^[0-9]+%.%s*(.+)$")
+  if stripped and string.upper(whdc_trim(stripped)) == configured then
+    return true
+  end
+
+  return false
+end
+
 function WHDC:ReceiveSyncChannel(msg, channelName, sender)
-  if string.upper(channelName or "") ~= string.upper(WHDC_DB.channel_name or "") then
+  if not whdc_sync_channel_matches(channelName) then
     return
   end
 
   local me = UnitName("player")
-  if me and sender and string.upper(sender) == string.upper(me) then
+  local senderName = tostring(sender or "")
+  if me and senderName ~= "" and string.upper(senderName) == string.upper(me) then
     return
   end
 
@@ -686,6 +706,6 @@ eventFrame:SetScript("OnEvent", function()
     WHDC:ReceiveIPC(arg1, arg2, arg3, arg4)
   elseif event == "CHAT_MSG_CHANNEL" then
     -- Channel args differ slightly between client builds; resolve defensively.
-    WHDC:ReceiveSyncChannel(arg1, arg9 or arg8 or arg4, arg2 or arg4)
+    WHDC:ReceiveSyncChannel(arg1, arg9 or arg4 or arg8, arg2 or arg4)
   end
 end)
