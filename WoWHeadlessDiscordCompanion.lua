@@ -341,8 +341,19 @@ function WHDC:RequestPayload(name)
 end
 
 function WHDC:RunTest()
-  local line = self:QueueRelay("PING", tostring(time()))
-  whdc_msg("Sent test line: " .. line)
+  local nonce = whdc_next_nonce()
+  local payload = "test:" .. tostring(time())
+  local sig = whdc_cheap_sig("PING", nonce, payload, WHDC_DB.password)
+  local line = whdc_pack_line("PING", nonce, payload, sig)
+
+  table.insert(WHDC_DB.history, {
+    ts = whdc_now(),
+    line = line,
+    sync = true
+  })
+
+  self:QueueSyncChannelMessage(line)
+  whdc_msg("Queued sync test line for channel '" .. WHDC_DB.channel_name .. "': " .. line)
 end
 
 function WHDC:HandleProtocolCommand(cmd, payload)
@@ -406,14 +417,8 @@ function WHDC:ReceiveSyncChannel(msg, channelName, sender)
 end
 
 function WHDC:PrintHelp()
-  whdc_msg("/whdc pwd <password> [channel] - set password + channel (GUILD/RAID/PARTY/WHISPER)")
-  whdc_msg("/whdc store <name> <payload> - store payload and export to /wow/imports when API exists")
-  whdc_msg("/whdc list - list stored payloads")
-  whdc_msg("/whdc send <name> - send signed import_payload line")
-  whdc_msg("/whdc pull <name> - send signed request_import line")
-  whdc_msg("/whdc test - send signed test line")
+  whdc_msg("/whdc test - queue signed test line to sync channel")
   whdc_msg("/whdc sync <channel_name> [channel_pass] - set sync chat channel")
-  whdc_msg("/whdc ipc <COMMAND> [payload] - send baseline command frame")
   whdc_msg("/whdc gui - show command GUI")
 end
 
@@ -426,53 +431,6 @@ function WHDC:HandleCommand(msg)
 
   local cmd, rest = string.match(msg, "^(%S+)%s*(.-)$")
   cmd = string.lower(cmd or "")
-
-  if cmd == "pwd" then
-    local password, channel = string.match(rest, "^(%S+)%s*(.*)$")
-    if not password then
-      whdc_msg("Usage: /whdc pwd <password> [channel]")
-      return
-    end
-    channel = whdc_trim(channel)
-    if channel == "" then channel = nil end
-    self:SetPassword(password, channel)
-    return
-  end
-
-  if cmd == "store" then
-    local name, payload = string.match(rest, "^(%S+)%s+(.+)$")
-    if not name then
-      whdc_msg("Usage: /whdc store <name> <payload>")
-      return
-    end
-    self:StorePayload(name, payload)
-    return
-  end
-
-  if cmd == "list" then
-    self:ListPayloads()
-    return
-  end
-
-  if cmd == "send" then
-    local name = string.match(rest, "^(%S+)$")
-    if not name then
-      whdc_msg("Usage: /whdc send <name>")
-      return
-    end
-    self:SendPayload(name)
-    return
-  end
-
-  if cmd == "pull" then
-    local name = string.match(rest, "^(%S+)$")
-    if not name then
-      whdc_msg("Usage: /whdc pull <name>")
-      return
-    end
-    self:RequestPayload(name)
-    return
-  end
 
   if cmd == "test" then
     self:RunTest()
@@ -489,21 +447,6 @@ function WHDC:HandleCommand(msg)
     return
   end
 
-  if cmd == "ipc" then
-    local outCmd, payload = string.match(rest, "^(%S+)%s*(.*)$")
-    if not outCmd then
-      whdc_msg("Usage: /whdc ipc <COMMAND> [payload]")
-      return
-    end
-    local line, err = self:QueueRelay(string.upper(outCmd), payload or "")
-    if not line then
-      whdc_msg("IPC send rejected: " .. err)
-      return
-    end
-    whdc_msg("Sent signed line: " .. line)
-    return
-  end
-
   if cmd == "gui" then
     WHDC_ShowGUI()
     return
@@ -516,8 +459,8 @@ function WHDC_CreateGUI()
   if WHDC_Frame then return end
 
   local frame = CreateFrame("Frame", "WHDC_Frame", UIParent)
-  frame:SetWidth(420)
-  frame:SetHeight(200)
+  frame:SetWidth(460)
+  frame:SetHeight(250)
   frame:SetPoint("CENTER", UIParent, "CENTER", 0, 0)
   frame:SetBackdrop({
     bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
@@ -531,46 +474,110 @@ function WHDC_CreateGUI()
 
   local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   title:SetPoint("TOP", frame, "TOP", 0, -16)
-  title:SetText("WHDC Command Console")
+  title:SetText("WHDC Sync Settings")
 
-  local editBox = CreateFrame("EditBox", "WHDC_CommandInput", frame, "InputBoxTemplate")
-  editBox:SetAutoFocus(false)
-  editBox:SetWidth(340)
-  editBox:SetHeight(24)
-  editBox:SetPoint("TOP", frame, "TOP", 0, -50)
-  editBox:SetText("pwd change-me GUILD")
+  local joinHelp = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  joinHelp:SetPoint("TOP", frame, "TOP", 0, -34)
+  joinHelp:SetText("Save settings, then join the sync channel and send a test line")
 
-  local runBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  runBtn:SetWidth(120)
-  runBtn:SetHeight(24)
-  runBtn:SetPoint("TOPLEFT", editBox, "BOTTOMLEFT", 0, -14)
-  runBtn:SetText("Run")
+  local channelNameLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  channelNameLabel:SetPoint("TOPLEFT", frame, "TOPLEFT", 28, -58)
+  channelNameLabel:SetText("Channel Name")
+
+  local channelNameInput = CreateFrame("EditBox", "WHDC_ChannelNameInput", frame, "InputBoxTemplate")
+  channelNameInput:SetAutoFocus(false)
+  channelNameInput:SetWidth(270)
+  channelNameInput:SetHeight(24)
+  channelNameInput:SetPoint("LEFT", channelNameLabel, "RIGHT", 20, 0)
+
+  local channelPassLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  channelPassLabel:SetPoint("TOPLEFT", channelNameLabel, "BOTTOMLEFT", 0, -24)
+  channelPassLabel:SetText("Channel Pass")
+
+  local channelPassInput = CreateFrame("EditBox", "WHDC_ChannelPassInput", frame, "InputBoxTemplate")
+  channelPassInput:SetAutoFocus(false)
+  channelPassInput:SetWidth(270)
+  channelPassInput:SetHeight(24)
+  channelPassInput:SetPoint("LEFT", channelPassLabel, "RIGHT", 26, 0)
+
+  local passwordLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  passwordLabel:SetPoint("TOPLEFT", channelPassLabel, "BOTTOMLEFT", 0, -24)
+  passwordLabel:SetText("IPC Password")
+
+  local passwordInput = CreateFrame("EditBox", "WHDC_PasswordInput", frame, "InputBoxTemplate")
+  passwordInput:SetAutoFocus(false)
+  passwordInput:SetWidth(270)
+  passwordInput:SetHeight(24)
+  passwordInput:SetPoint("LEFT", passwordLabel, "RIGHT", 24, 0)
+
+  local saveBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+  saveBtn:SetWidth(100)
+  saveBtn:SetHeight(24)
+  saveBtn:SetPoint("BOTTOMLEFT", frame, "BOTTOMLEFT", 24, 26)
+  saveBtn:SetText("Save")
+
+  local joinBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+  joinBtn:SetWidth(100)
+  joinBtn:SetHeight(24)
+  joinBtn:SetPoint("LEFT", saveBtn, "RIGHT", 10, 0)
+  joinBtn:SetText("Join")
 
   local testBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  testBtn:SetWidth(120)
+  testBtn:SetWidth(100)
   testBtn:SetHeight(24)
-  testBtn:SetPoint("LEFT", runBtn, "RIGHT", 12, 0)
+  testBtn:SetPoint("LEFT", joinBtn, "RIGHT", 10, 0)
   testBtn:SetText("Test")
 
   local closeBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  closeBtn:SetWidth(120)
+  closeBtn:SetWidth(100)
   closeBtn:SetHeight(24)
-  closeBtn:SetPoint("LEFT", testBtn, "RIGHT", 12, 0)
+  closeBtn:SetPoint("LEFT", testBtn, "RIGHT", 10, 0)
   closeBtn:SetText("Close")
 
-  runBtn:SetScript("OnClick", function()
-    local text = whdc_trim(editBox:GetText())
-    if text ~= "" then
-      WHDC:HandleCommand(text)
+  local function saveSettingsFromGUI()
+    local channelName = whdc_trim(channelNameInput:GetText())
+    local channelPass = whdc_trim(channelPassInput:GetText())
+    local password = whdc_trim(passwordInput:GetText())
+
+    if channelName ~= "" then
+      WHDC_DB.channel_name = channelName
+    end
+    WHDC_DB.channel_pass = channelPass
+
+    if password ~= "" then
+      WHDC_DB.password = password
+    end
+
+    whdc_msg("Settings saved to SavedVariables (WTF). channel=" .. WHDC_DB.channel_name)
+  end
+
+  saveBtn:SetScript("OnClick", function()
+    saveSettingsFromGUI()
+  end)
+
+  joinBtn:SetScript("OnClick", function()
+    saveSettingsFromGUI()
+    if type(JoinChannelByName) == "function" then
+      JoinChannelByName(WHDC_DB.channel_name, WHDC_DB.channel_pass)
+      whdc_msg("Join requested for sync channel '" .. WHDC_DB.channel_name .. "'.")
+    else
+      whdc_msg("JoinChannelByName API unavailable.")
     end
   end)
 
   testBtn:SetScript("OnClick", function()
+    saveSettingsFromGUI()
     WHDC:RunTest()
   end)
 
   closeBtn:SetScript("OnClick", function()
     frame:Hide()
+  end)
+
+  frame:SetScript("OnShow", function()
+    channelNameInput:SetText(WHDC_DB.channel_name or "")
+    channelPassInput:SetText(WHDC_DB.channel_pass or "")
+    passwordInput:SetText(WHDC_DB.password or "")
   end)
 end
 
