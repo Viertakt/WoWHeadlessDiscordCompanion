@@ -16,6 +16,8 @@ WHDC.defaults = {
   history = {},
   replayWindowSeconds = 180,
   recentFrames = {},
+  pendingSyncPings = {},
+  pendingPingWindowSeconds = 120,
   channelSendQueue = {},
   channelMinInterval = 1.0,
   lastChannelSendAt = 0
@@ -23,6 +25,10 @@ WHDC.defaults = {
 
 local function whdc_msg(text)
   DEFAULT_CHAT_FRAME:AddMessage("|cff33ff99WHDC|r " .. text)
+end
+
+local function whdc_system_msg(text)
+  DEFAULT_CHAT_FRAME:AddMessage("|cffffff00[SYSTEM]|r " .. text)
 end
 
 local function whdc_trim(text)
@@ -145,6 +151,27 @@ local function whdc_frame_seen(line)
   end
   table.insert(WHDC_DB.recentFrames, { line = line, at = time() })
   return false
+end
+
+local function whdc_track_sync_ping(nonce)
+  local now = time()
+  local maxAge = tonumber(WHDC_DB.pendingPingWindowSeconds) or 120
+  local key
+  for key in pairs(WHDC_DB.pendingSyncPings) do
+    local at = tonumber(WHDC_DB.pendingSyncPings[key]) or 0
+    if now - at > maxAge then
+      WHDC_DB.pendingSyncPings[key] = nil
+    end
+  end
+  WHDC_DB.pendingSyncPings[nonce] = now
+end
+
+local function whdc_consume_sync_ping(nonce)
+  if not WHDC_DB.pendingSyncPings[nonce] then
+    return false
+  end
+  WHDC_DB.pendingSyncPings[nonce] = nil
+  return true
 end
 
 local function whdc_write_import(name, payload)
@@ -298,6 +325,40 @@ function WHDC:SendSyncChannelMessage(message)
   return true
 end
 
+function WHDC:QueueSignedSyncLine(cmd, payload, nonce)
+  payload = payload or ""
+
+  local finalCmd = string.upper(cmd or "")
+  if not whdc_is_safe_token(finalCmd) then
+    return nil, nil, "invalid command token"
+  end
+
+  if nonce and nonce ~= "" then
+    nonce = tostring(nonce)
+  else
+    nonce = whdc_next_nonce()
+  end
+
+  if not whdc_is_safe_token(nonce) then
+    return nil, nil, "invalid nonce token"
+  end
+
+  local sig = whdc_cheap_sig(finalCmd, nonce, payload, WHDC_DB.password)
+  local line = whdc_pack_line(finalCmd, nonce, payload, sig)
+
+  table.insert(WHDC_DB.history, {
+    ts = whdc_now(),
+    line = line,
+    sync = true,
+    cmd = finalCmd,
+    nonce = nonce,
+    payload = payload
+  })
+
+  self:QueueSyncChannelMessage(line)
+  return line, nonce
+end
+
 function WHDC:QueueSyncChannelMessage(message)
   table.insert(WHDC_DB.channelSendQueue, {
     at = time(),
@@ -341,24 +402,35 @@ function WHDC:RequestPayload(name)
 end
 
 function WHDC:RunTest()
-  local nonce = whdc_next_nonce()
   local payload = "test:" .. tostring(time())
-  local sig = whdc_cheap_sig("PING", nonce, payload, WHDC_DB.password)
-  local line = whdc_pack_line("PING", nonce, payload, sig)
+  local line, nonce, err = self:QueueSignedSyncLine("PING", payload)
+  if not line then
+    whdc_msg("Could not queue sync test: " .. (err or "unknown error"))
+    return
+  end
 
-  table.insert(WHDC_DB.history, {
-    ts = whdc_now(),
-    line = line,
-    sync = true
-  })
-
-  self:QueueSyncChannelMessage(line)
-  whdc_msg("Queued sync test line for channel '" .. WHDC_DB.channel_name .. "': " .. line)
+  whdc_track_sync_ping(nonce)
+  whdc_msg("Queued sync ping for channel '" .. WHDC_DB.channel_name .. "': " .. line)
 end
 
-function WHDC:HandleProtocolCommand(cmd, payload)
+function WHDC:HandleProtocolCommand(cmd, nonce, payload, sender, source)
   if cmd == "PING" then
-    self:QueueRelay("PONG", UnitName("player") or "unknown")
+    local who = UnitName("player") or "unknown"
+    if source == "sync" then
+      self:QueueSignedSyncLine("PONG", who, nonce)
+    else
+      self:QueueRelay("PONG", who)
+    end
+    return
+  end
+
+  if cmd == "PONG" and source == "sync" then
+    local from = sender or payload or "unknown"
+    if whdc_consume_sync_ping(nonce) then
+      whdc_system_msg("Sync test succesvol: PONG ontvangen van " .. from .. ".")
+    else
+      whdc_system_msg("PONG ontvangen op sync channel van " .. from .. ".")
+    end
     return
   end
 
@@ -395,11 +467,16 @@ function WHDC:ReceiveIPC(prefix, line, channel, sender)
     payload = payload
   })
 
-  self:HandleProtocolCommand(cmd, payload)
+  self:HandleProtocolCommand(cmd, nonce, payload, sender, "addon")
 end
 
 function WHDC:ReceiveSyncChannel(msg, channelName, sender)
   if string.upper(channelName or "") ~= string.upper(WHDC_DB.channel_name or "") then
+    return
+  end
+
+  local me = UnitName("player")
+  if me and sender and string.upper(sender) == string.upper(me) then
     return
   end
 
@@ -413,7 +490,7 @@ function WHDC:ReceiveSyncChannel(msg, channelName, sender)
   local payload = c
   whdc_msg("SYNC recv " .. cmd .. " nonce=" .. nonce .. " from " .. (sender or "?"))
 
-  self:HandleProtocolCommand(cmd, payload)
+  self:HandleProtocolCommand(cmd, nonce, payload, sender, "sync")
 end
 
 function WHDC:PrintHelp()
@@ -608,7 +685,7 @@ eventFrame:SetScript("OnEvent", function()
     -- Vanilla handler args: arg1=prefix, arg2=message, arg3=channel, arg4=sender
     WHDC:ReceiveIPC(arg1, arg2, arg3, arg4)
   elseif event == "CHAT_MSG_CHANNEL" then
-    -- Vanilla handler args: arg1=message, arg8=channel name, arg4=sender
-    WHDC:ReceiveSyncChannel(arg1, arg8, arg4)
+    -- Channel args differ slightly between client builds; resolve defensively.
+    WHDC:ReceiveSyncChannel(arg1, arg9 or arg8 or arg4, arg2 or arg4)
   end
 end)
